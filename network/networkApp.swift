@@ -133,6 +133,9 @@ struct NetworkView: View {
     @State private var isConnected = false
     @State private var showingCredentialAlert = false
 
+    /// When true, current connection is via VLESS tunnel; when false, via IPSec (or disconnected).
+    @State private var connectedViaVless = false
+
     @State private var showingSettings = false
 
     // Supabase VPN servers
@@ -1451,14 +1454,49 @@ struct NetworkView: View {
     }
     
     private func checkVPNStatus() {
-        // VPN is available on both iOS and macOS
-        
+        // Prefer VLESS tunnel status (same as dopplerswift); fallback to IPSec.
+        let vlessStatus = VlessTunnelManager.shared.currentStatus
+        if vlessStatus == .connected {
+            DispatchQueue.main.async {
+                self.isConnected = true
+                self.connectedViaVless = true
+                self.isLoading = false
+                self.statusMessage = ""
+            }
+            VlessTunnelManager.shared.observeStatus { status in
+                DispatchQueue.main.async {
+                    switch status {
+                    case .connected:
+                        self.isConnected = true
+                        self.connectedViaVless = true
+                        self.isLoading = false
+                        self.statusMessage = ""
+                    case .connecting, .reasserting:
+                        self.isLoading = true
+                    case .disconnecting:
+                        self.isLoading = true
+                    case .disconnected, .invalid:
+                        self.isConnected = false
+                        self.connectedViaVless = false
+                        self.isLoading = false
+                        self.statusMessage = ""
+                    @unknown default:
+                        self.isConnected = false
+                        self.connectedViaVless = false
+                        self.isLoading = false
+                        self.statusMessage = ""
+                    }
+                }
+            }
+            return
+        }
+
+        connectedViaVless = false
         let vpnManager = NEVPNManager.shared()
         vpnManager.loadFromPreferences { error in
             if let error = error {
                 DispatchQueue.main.async {
-                    // Handle simulator-specific VPN errors gracefully
-                    if error.localizedDescription.contains("IPC failed") || 
+                    if error.localizedDescription.contains("IPC failed") ||
                        error.localizedDescription.contains("Connection invalid") {
                         self.statusMessage = L10n.statusVpnSimulator
                     } else {
@@ -1467,16 +1505,13 @@ struct NetworkView: View {
                 }
                 return
             }
-            
+
             DispatchQueue.main.async {
                 switch vpnManager.connection.status {
                 case .connected:
                     self.isConnected = true
                     self.isLoading = false
                     self.statusMessage = ""
-                    
-
-                    
                 case .connecting:
                     self.isLoading = true
                     self.statusMessage = ""
@@ -1493,8 +1528,7 @@ struct NetworkView: View {
                     self.statusMessage = ""
                 }
             }
-            
-            // Set up observation of status changes
+
             NotificationCenter.default.addObserver(
                 forName: .NEVPNStatusDidChange,
                 object: vpnManager.connection,
@@ -1505,11 +1539,6 @@ struct NetworkView: View {
                             self.isConnected = true
                             self.isLoading = false
                             self.statusMessage = ""
-                            
-
-                            
-
-                            
                         case .connecting:
                             self.isLoading = true
                             self.statusMessage = ""
@@ -1554,38 +1583,84 @@ struct NetworkView: View {
         return
         #endif
 
-        // Ensure a server is selected
         guard let server = selectedServer else {
             statusMessage = L10n.statusSelectServerFirst
             return
         }
 
-        // Ensure server has credentials
+        // Prefer VLESS when available (same technology as dopplerswift / Reality-first).
+        if server.hasVlessConfig, let vlessUrl = server.resolvedVlessUrl {
+            connectViaVless(vlessUrl: vlessUrl, server: server)
+            return
+        }
+
+        // Fallback: IPSec with OpenVPN-style credentials
         guard let username = server.openvpnUsername,
               let password = server.openvpnPassword else {
             statusMessage = L10n.statusServerCredentialsNotAvailable
             return
         }
-        
+
+        connectViaIPSec(server: server, username: username, password: password)
+    }
+
+    private func connectViaVless(vlessUrl: String, server: VPNServer) {
+        connectedViaVless = true
         isLoading = true
         statusMessage = L10n.statusConnecting(server.localizedCityName(preferredLocale: languageManager.currentLanguageCode))
-        
+
+        VlessTunnelManager.shared.observeStatus { [self] status in
+            DispatchQueue.main.async {
+                switch status {
+                case .connected:
+                    self.isConnected = true
+                    self.isLoading = false
+                    self.statusMessage = ""
+                case .connecting, .reasserting:
+                    self.isLoading = true
+                    self.statusMessage = L10n.statusConnecting(server.localizedCityName(preferredLocale: languageManager.currentLanguageCode))
+                case .disconnecting:
+                    self.isLoading = true
+                case .disconnected, .invalid:
+                    self.isConnected = false
+                    self.isLoading = false
+                    self.connectedViaVless = false
+                    self.statusMessage = ""
+                @unknown default:
+                    self.isConnected = false
+                    self.isLoading = false
+                    self.connectedViaVless = false
+                    self.statusMessage = ""
+                }
+            }
+        }
+
+        VlessTunnelManager.shared.connect(vlessUrl: vlessUrl) { error in
+            DispatchQueue.main.async {
+                if let error = error {
+                    self.isLoading = false
+                    self.connectedViaVless = false
+                    self.statusMessage = "VLESS: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func connectViaIPSec(server: VPNServer, username: String, password: String) {
+        connectedViaVless = false
+        isLoading = true
+        statusMessage = L10n.statusConnecting(server.localizedCityName(preferredLocale: languageManager.currentLanguageCode))
+
         let serverAddress = server.serverAddress
-        
-        // Get shared secret from keychain (still needed for IPSec)
+
         guard let sharedSecretData = loadFromKeychain(key: kKeychainVPNSharedSecretKey),
               let sharedSecret = String(data: sharedSecretData, encoding: .utf8) else {
-            
-            DispatchQueue.main.async {
-                self.statusMessage = "Error: Missing shared secret"
-                self.isLoading = false
-                self.saveDefaultCredentials()
-            }
+            statusMessage = "Error: Missing shared secret"
+            isLoading = false
+            saveDefaultCredentials()
             return
         }
-        
 
-        
         let vpnManager = NEVPNManager.shared()
         vpnManager.loadFromPreferences { error in
             if let error = error {
@@ -1595,13 +1670,11 @@ struct NetworkView: View {
                 }
                 return
             }
-            
-            // Setup IPSec configuration
+
             let ipSecConfig = NEVPNProtocolIPSec()
             ipSecConfig.serverAddress = serverAddress
             ipSecConfig.username = username
-            
-            // Convert password to data and save as password reference
+
             if let passwordRef = self.createPasswordReference(username: username, password: password) {
                 ipSecConfig.passwordReference = passwordRef
             } else {
@@ -1611,7 +1684,7 @@ struct NetworkView: View {
                 }
                 return
             }
-            
+
             ipSecConfig.authenticationMethod = .sharedSecret
             if let sharedSecretRef = self.createSharedSecretReference(secret: sharedSecret) {
                 ipSecConfig.sharedSecretReference = sharedSecretRef
@@ -1622,17 +1695,15 @@ struct NetworkView: View {
                 }
                 return
             }
-            
-            // Match the config in the mobileconfig file
+
             ipSecConfig.localIdentifier = ""
             ipSecConfig.remoteIdentifier = serverAddress
-            ipSecConfig.useExtendedAuthentication = true  // This is equivalent to XAuthEnabled in mobileconfig
-            
+            ipSecConfig.useExtendedAuthentication = true
+
             vpnManager.protocolConfiguration = ipSecConfig
             vpnManager.isEnabled = true
             vpnManager.localizedDescription = "FoxyWall"
-            
-            // Save the configuration
+
             vpnManager.saveToPreferences { error in
                 if let error = error {
                     DispatchQueue.main.async {
@@ -1641,14 +1712,9 @@ struct NetworkView: View {
                     }
                     return
                 }
-                
-                // Try to connect
+
                 do {
                     try vpnManager.connection.startVPNTunnel()
-
-                    
-
-                    
                 } catch let error {
                     DispatchQueue.main.async {
                         self.statusMessage = "Failed to start VPN: \(error.localizedDescription)"
@@ -1727,13 +1793,19 @@ struct NetworkView: View {
         statusMessage = L10n.statusVpnSimulator
         return
         #endif
-        
+
         isLoading = true
-statusMessage = ""
-        
-        let vpnManager = NEVPNManager.shared()
-        vpnManager.connection.stopVPNTunnel()
-        // Status will be updated through the notification observer
+        statusMessage = ""
+
+        if connectedViaVless {
+            VlessTunnelManager.shared.disconnect()
+            connectedViaVless = false
+            isConnected = false
+            isLoading = false
+            statusMessage = ""
+        } else {
+            NEVPNManager.shared().connection.stopVPNTunnel()
+        }
     }
     
     // MARK: - Keychain Helper Functions
